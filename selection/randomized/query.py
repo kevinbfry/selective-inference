@@ -1,16 +1,20 @@
+import functools
 from itertools import product
-import numpy as np
 
+import numpy as np
 from scipy.stats import norm as ndist
 from scipy.optimize import bisect
 
 from regreg.affine import power_L
+import regreg.api as rr
 
-from .selective_MLE_utils import solve_barrier_nonneg
+from .selective_MLE_utils import solve_barrier_affine as solve_barrier_affine_C
 
 from ..distributions.api import discrete_family
 from ..sampling.langevin import projected_langevin
-from ..constraints.affine import sample_from_constraints
+from ..constraints.affine import (sample_from_constraints,
+                                  constraints)
+from ..algorithms.softmax import softmax_objective
 
 class query(object):
 
@@ -86,7 +90,6 @@ class query(object):
                 cov_target_score, 
                 alternatives,
                 opt_sample=None,
-                R_opt_sample=None,
                 target_sample=None,
                 parameter=None,
                 level=0.9,
@@ -180,8 +183,81 @@ class query(object):
                                           cov_target,
                                           cov_target_score,
                                           self.observed_opt_state,
+                                          level=level,
                                           solve_args=solve_args)
 
+
+class gaussian_query(query):
+
+    useC = True
+
+    """
+    A class with Gaussian perturbation to the objective -- easy to apply CLT to such things
+    """
+    def fit(self, perturb=None):
+
+        p = self.nfeature
+
+        # take a new perturbation if supplied
+        if perturb is not None:
+            self._initial_omega = perturb
+        if self._initial_omega is None:
+            self._initial_omega = self.randomizer.sample()
+
+    # Private methods
+
+    def _set_sampler(self, 
+                     A_scaling,
+                     b_scaling,
+                     opt_linear,
+                     opt_offset):
+
+        if not np.all(A_scaling.dot(self.observed_opt_state) - b_scaling <= 0):
+            raise ValueError('constraints not satisfied')
+
+        cond_mean, cond_cov, cond_precision, logdens_linear = self._setup_implied_gaussian(opt_linear, opt_offset)
+
+        def log_density(logdens_linear, offset, cond_prec, score, opt):
+            if score.ndim == 1:
+                mean_term = logdens_linear.dot(score.T + offset).T
+            else:
+                mean_term = logdens_linear.dot(score.T + offset[:, None]).T
+            arg = opt + mean_term
+            return - 0.5 * np.sum(arg * cond_prec.dot(arg.T).T, 1)
+
+        log_density = functools.partial(log_density, logdens_linear, opt_offset, cond_precision)
+
+        self.cond_mean, self.cond_cov = cond_mean, cond_cov
+
+        affine_con = constraints(A_scaling,
+                                 b_scaling,
+                                 mean=cond_mean,
+                                 covariance=cond_cov)
+
+        self.sampler = affine_gaussian_sampler(affine_con,
+                                               self.observed_opt_state,
+                                               self.observed_score_state,
+                                               log_density,
+                                               (logdens_linear, opt_offset),
+                                               selection_info=self.selection_variable,
+                                               useC=self.useC)
+
+    def _setup_implied_gaussian(self, opt_linear, opt_offset):
+
+        _, prec = self.randomizer.cov_prec
+
+        if np.asarray(prec).shape in [(), (0,)]:
+            cond_precision = opt_linear.T.dot(opt_linear) * prec
+            cond_cov = np.linalg.inv(cond_precision)
+            logdens_linear = cond_cov.dot(opt_linear.T) * prec
+        else:
+            cond_precision = opt_linear.T.dot(prec.dot(opt_linear))
+            cond_cov = np.linalg.inv(cond_precision)
+            logdens_linear = cond_cov.dot(opt_linear.T).dot(prec)
+
+        cond_mean = -logdens_linear.dot(self.observed_score_state + opt_offset)
+
+        return cond_mean, cond_cov, cond_precision, logdens_linear
 
 class multiple_queries(object):
 
@@ -638,7 +714,8 @@ class affine_gaussian_sampler(optimization_sampler):
                  observed_score_state,
                  log_density,
                  logdens_transform, # described how score enters log_density.
-                 selection_info=None):
+                 selection_info=None,
+                 useC=False):
 
         '''
         Parameters
@@ -657,6 +734,7 @@ class affine_gaussian_sampler(optimization_sampler):
         self.selection_info = selection_info
         self.log_density = log_density
         self.logdens_transform = logdens_transform
+        self.useC = useC
 
     def sample(self, ndraw, burnin):
         '''
@@ -685,55 +763,36 @@ class affine_gaussian_sampler(optimization_sampler):
                       observed_target, 
                       cov_target, 
                       cov_target_score, 
-                      feasible_point, 
+                      init_soln, # initial (observed) value of optimization variables -- used as a feasible point.
+                                 # precise value used only for independent estimator 
                       solve_args={'tol':1.e-12}, 
-                      alpha=0.1):
+                      level=0.9):
         """
         Selective MLE based on approximation of
         CGF.
 
         """
-        if np.asarray(observed_target).shape in [(), (0,)]:
-            raise ValueError('no target specified')
 
-        prec_target = np.linalg.inv(cov_target)
-        logdens_lin, _ = self.logdens_transform
-        target_lin = - logdens_lin.dot(cov_target_score.T.dot(prec_target)) # this determines how the conditional mean of optimization variables
-                                                                            # vary with target
-                                                                            # logdens_lin determines how the argument of the optimization density
-                                                                            # depends on the score, not how the mean depends on score, hence the minus sign
-        target_offset = self.affine_con.mean - target_lin.dot(observed_target)
+        return selective_MLE(observed_target, 
+                             cov_target, 
+                             cov_target_score, 
+                             init_soln, 
+                             self.affine_con.mean,
+                             self.affine_con.covariance,
+                             self.logdens_transform[0],
+                             self.affine_con.linear_part,
+                             self.affine_con.offset,
+                             solve_args=solve_args,
+                             level=level,
+                             useC=self.useC)
 
-        cov_opt = self.affine_con.covariance
-        prec_opt = np.linalg.inv(cov_opt)
-
-        conjugate_arg = prec_opt.dot(self.affine_con.mean)
-
-        init_soln = feasible_point
-        val, soln, hess = _solve_barrier_affine(conjugate_arg,
-                                                prec_opt,
-                                                self.affine_con,
-                                                init_soln,
-                                                **solve_args)
-
-        final_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(self.affine_con.mean - soln)))
-        ind_unbiased_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(self.affine_con.mean
-                                                                                                - feasible_point)))
-        L = target_lin.T.dot(prec_opt)
-        observed_info_natural = prec_target + L.dot(target_lin) - L.dot(hess.dot(L.T))
-        observed_info_mean = cov_target.dot(observed_info_natural.dot(cov_target))
-
-        Z_scores = final_estimator / np.sqrt(np.diag(observed_info_mean))
-        pvalues = ndist.cdf(Z_scores)
-        pvalues = 2 * np.minimum(pvalues, 1 - pvalues)
-
-        quantile = ndist.ppf(1 - alpha / 2.)
-        intervals = np.vstack([final_estimator - quantile * np.sqrt(np.diag(observed_info_mean)),
-                               final_estimator + quantile * np.sqrt(np.diag(observed_info_mean))]).T
-
-        return final_estimator, observed_info_mean, Z_scores, pvalues, intervals, ind_unbiased_estimator
-
-    def reparam_map(self, theta, observed_target, cov_target, cov_target_score, feasible_point, solve_args={}):
+    def reparam_map(self, 
+                    parameter_target, 
+                    observed_target, 
+                    cov_target, 
+                    cov_target_score, 
+                    init_soln, 
+                    solve_args={'tol':1.e-12}):
 
         prec_target = np.linalg.inv(cov_target)
         ndim = prec_target.shape[0]
@@ -744,21 +803,28 @@ class affine_gaussian_sampler(optimization_sampler):
         cov_opt = self.affine_con.covariance
         prec_opt = np.linalg.inv(cov_opt)
 
-        mean_param = target_lin.dot(theta)+target_offset
+        mean_param = target_lin.dot(parameter_target) + target_offset
         conjugate_arg = prec_opt.dot(mean_param)
-        init_soln = feasible_point
-        val, soln, hess = _solve_barrier_nonneg(conjugate_arg,
-                                                prec_opt,
-                                                init_soln,
-                                                **solve_args)
 
+        if useC:
+            solver = solve_barrier_affine_C
+        else:
+            solver = solve_barrier_affine_py
+
+        val, soln, hess = solver(conjugate_arg,
+                                 prec_opt, # JT: I think this quadratic is wrong should involve cov_target and target_lin too?
+                                 init_soln,
+                                 self.affine_con.linear_part,
+                                 self.affine_con.offset,
+                                 **solve_args)
+            
         inter_map = cov_target.dot(target_lin.T.dot(prec_opt))
-        param_map = theta + inter_map.dot(mean_param - soln)
-        log_normalizer_map = (theta.T.dot(prec_target + target_lin.T.dot(prec_opt).dot(target_lin)).dot(theta))/2. \
-                             - theta.T.dot(target_lin.T).prec_opt.dot(soln) - target_offset.T.dot(prec_opt).dot(target_offset)/2. \
-                             + val - (param_map.T.dot(prec_target).param_map)/2.
+        param_map = parameter_target + inter_map.dot(mean_param - soln)
+        log_normalizer_map = ((parameter_target.T.dot(prec_target + target_lin.T.dot(prec_opt).dot(target_lin)).dot(parameter_target))/2. 
+                              - parameter_target.T.dot(target_lin.T).dot(prec_opt.dot(soln)) - target_offset.T.dot(prec_opt).dot(target_offset)/2. 
+                              + val - (param_map.T.dot(prec_target).dot(param_map))/2.)
 
-        jacobian_map = (np.identity(ndim)+ inter_map.dot(target_lin)) - inter_map.dot(hess).dot(prec_opt.dot(target_lin))
+        jacobian_map = (np.identity(ndim) + inter_map.dot(target_lin)) - inter_map.dot(hess).dot(prec_opt.dot(target_lin))
 
         return param_map, log_normalizer_map, jacobian_map
 
@@ -1093,26 +1159,25 @@ def naive_pvalues(diag_cov, observed, parameter):
         pvalues[j] = 2 * min(pval, 1-pval)
     return pvalues
 
-def _solve_barrier_affine(conjugate_arg,
-                          precision,
-                          constraints,
-                          feasible_point=None,
-                          step=1,
-                          nstep=1000,
-                          min_its=100,
-                          tol=1.e-8):
+def solve_barrier_affine_py(conjugate_arg,
+                            precision,
+                            feasible_point,
+                            con_linear,
+                            con_offset,
+                            step=1,
+                            nstep=1000,
+                            min_its=200,
+                            tol=1.e-10):
 
-    con_linear = constraints.linear_part
-    con_offset = constraints.offset
     scaling = np.sqrt(np.diag(con_linear.dot(precision).dot(con_linear.T)))
 
     if feasible_point is None:
         feasible_point = 1. / scaling
 
     objective = lambda u: -u.T.dot(conjugate_arg) + u.T.dot(precision).dot(u)/2. \
-                          + np.log(1.+ 1./((con_offset-con_linear.dot(u))/ scaling)).sum()
-    grad = lambda u: -conjugate_arg + precision.dot(u) -con_linear.T.dot(1./(scaling + con_offset-con_linear.dot(u)) -
-                                                                       1./(con_offset-con_linear.dot(u)))
+                          + np.log(1.+ 1./((con_offset - con_linear.dot(u))/ scaling)).sum()
+    grad = lambda u: -conjugate_arg + precision.dot(u) - con_linear.T.dot(1./(scaling + con_offset - con_linear.dot(u)) -
+                                                                       1./(con_offset - con_linear.dot(u)))
     barrier_hessian = lambda u: con_linear.T.dot(np.diag(-1./((scaling + con_offset-con_linear.dot(u))**2.)
                                                  + 1./((con_offset-con_linear.dot(u))**2.))).dot(con_linear)
 
@@ -1230,3 +1295,136 @@ def _solve_barrier_nonneg(conjugate_arg,
 
     hess = np.linalg.inv(precision + np.diag(barrier_hessian(current)))
     return current_value, current, hess
+
+def selective_MLE(observed_target, 
+                  cov_target, 
+                  cov_target_score, 
+                  init_soln, # initial (observed) value of optimization variables -- used as a feasible point.
+                             # precise value used only for independent estimator 
+                  cond_mean,
+                  cond_cov,
+                  logdens_linear,
+                  linear_part,
+                  offset,
+                  solve_args={'tol':1.e-12}, 
+                  level=0.9,
+                  useC=False):
+    """
+    Selective MLE based on approximation of
+    CGF.
+
+    """
+
+    if np.asarray(observed_target).shape in [(), (0,)]:
+        raise ValueError('no target specified')
+
+    observed_target = np.atleast_1d(observed_target)
+    prec_target = np.linalg.inv(cov_target)
+
+    # target_lin determines how the conditional mean of optimization variables
+    # vary with target
+    # logdens_linear determines how the argument of the optimization density
+    # depends on the score, not how the mean depends on score, hence the minus sign
+
+    target_lin = - logdens_linear.dot(cov_target_score.T.dot(prec_target)) 
+    target_offset = cond_mean - target_lin.dot(observed_target)
+
+    prec_opt = np.linalg.inv(cond_cov)
+
+    conjugate_arg = prec_opt.dot(cond_mean)
+
+    if useC:
+        solver = solve_barrier_affine_C
+    else:
+        solver = solve_barrier_affine_py
+
+    val, soln, hess = solver(conjugate_arg,
+                             prec_opt,
+                             init_soln,
+                             linear_part,
+                             offset,
+                             **solve_args)
+
+    final_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean - soln)))
+    ind_unbiased_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean
+                                                                                            - init_soln)))
+    L = target_lin.T.dot(prec_opt)
+    observed_info_natural = prec_target + L.dot(target_lin) - L.dot(hess.dot(L.T))
+    observed_info_mean = cov_target.dot(observed_info_natural.dot(cov_target))
+
+    Z_scores = final_estimator / np.sqrt(np.diag(observed_info_mean))
+    pvalues = ndist.cdf(Z_scores)
+    pvalues = 2 * np.minimum(pvalues, 1 - pvalues)
+
+    alpha = 1 - level
+    quantile = ndist.ppf(1 - alpha / 2.)
+    intervals = np.vstack([final_estimator - quantile * np.sqrt(np.diag(observed_info_mean)),
+                           final_estimator + quantile * np.sqrt(np.diag(observed_info_mean))]).T
+
+    return final_estimator, observed_info_mean, Z_scores, pvalues, intervals, ind_unbiased_estimator
+
+
+def normalizing_constant(target_parameter,
+                         observed_target,
+                         cov_target,
+                         cov_target_score,
+                         feasible_point,
+                         cond_mean,
+                         cond_cov,
+                         logdens_linear,
+                         linear_part,
+                         offset,
+                         useC=False):
+
+    target_parameter = np.atleast_1d(target_parameter)
+
+    cond_precision = np.linalg.inv(cond_cov)
+    prec_target = np.linalg.inv(cov_target)
+    target_linear = -logdens_linear.dot(cov_target_score.dot(prec_target))
+    nuisance_correction = target_linear.dot(observed_target)
+    corrected_mean = cond_mean - nuisance_correction
+
+    # rest of the objective is the target mahalanobis distance
+    # plus the mahalanobis distance for optimization variables
+    # this includes a term linear in the target, i.e.
+    # the source of `target_linear`
+
+    ntarget = cov_target.shape[0]
+    nopt = cond_cov.shape[0]
+    full_Q = np.zeros((ntarget + nopt,
+                       ntarget + nopt))
+    full_Q[:ntarget][:,:ntarget] = (prec_target + target_linear.T.dot(cond_precision.dot(target_linear)))
+    full_Q[:ntarget][:,ntarget:] = -target_linear.dot(cond_precision)
+    full_Q[ntarget:][:,:ntarget] = (-target_linear.dot(cond_precision)).T
+    full_Q[ntarget:][:,ntarget:] = cond_precision
+
+    linear_term = np.hstack([-prec_target.dot(target_parameter) + 
+                              corrected_mean.dot(cond_precision).dot(target_linear), 
+                              -cond_precision.dot(corrected_mean)])
+
+    constant_term = 0.5 * (np.sum(target_parameter * prec_target.dot(target_parameter)) +
+                           np.sum(corrected_mean * cond_precision.dot(corrected_mean)))
+
+    full_con_linear = np.zeros((linear_part.shape[0],
+                                ntarget + nopt))
+    full_con_linear[:,ntarget:] = linear_part
+    full_feasible = np.zeros(ntarget + nopt)
+    full_feasible[ntarget:] = feasible_point
+
+    solve_args={'tol':1.e-12}
+
+    if useC:
+        solver = solve_barrier_affine_C
+    else:
+        solver = solve_barrier_affine_py
+
+    value, soln, hess = solver(-linear_term,
+                                full_Q,
+                                full_feasible,
+                                full_con_linear,
+                                offset,
+                                **solve_args)
+    return (-value + 0.5 * np.sum(target_parameter * prec_target.dot(target_parameter)), 
+             soln[:ntarget], 
+             hess[:ntarget][:,:ntarget])
+
