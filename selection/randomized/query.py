@@ -1326,8 +1326,12 @@ def selective_MLE(observed_target,
     # logdens_linear determines how the argument of the optimization density
     # depends on the score, not how the mean depends on score, hence the minus sign
 
-    target_lin = - logdens_linear.dot(cov_target_score.T.dot(prec_target)) 
-    target_offset = cond_mean - target_lin.dot(observed_target)
+    ## orig
+    # target_lin = - logdens_linear.dot(cov_target_score.T.dot(prec_target)) 
+    # target_offset = cond_mean - target_lin.dot(observed_target)
+
+    gamma = cov_target_score.T.dot(prec_target)
+    target_lin = - logdens_linear.dot(gamma) 
 
     prec_opt = np.linalg.inv(cond_cov)
 
@@ -1345,9 +1349,16 @@ def selective_MLE(observed_target,
                              offset,
                              **solve_args)
 
-    final_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean - soln)))
-    ind_unbiased_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean
-                                                                                            - init_soln)))
+    ## orig
+    # final_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean - soln)))
+    # ind_unbiased_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean
+    #                                                                                         - init_soln)))
+    
+    estimator_lin = cov_target.dot(target_lin.T.dot(prec_opt))
+    final_estimator = observed_target + estimator_lin.dot(cond_mean - soln)
+    ind_unbiased_estimator = observed_target + estimator_lin.dot(cond_mean - init_soln)
+    cov_unbiased_estimator = prec_target.dot((np.eye(prec_target.shape[0]) + estimator_lin.dot(target_lin)).T)
+
     L = target_lin.T.dot(prec_opt)
     observed_info_natural = prec_target + L.dot(target_lin) - L.dot(hess.dot(L.T))
     observed_info_mean = cov_target.dot(observed_info_natural.dot(cov_target))
@@ -1361,7 +1372,7 @@ def selective_MLE(observed_target,
     intervals = np.vstack([final_estimator - quantile * np.sqrt(np.diag(observed_info_mean)),
                            final_estimator + quantile * np.sqrt(np.diag(observed_info_mean))]).T
 
-    return final_estimator, observed_info_mean, Z_scores, pvalues, intervals, ind_unbiased_estimator
+    return final_estimator, observed_info_mean, Z_scores, pvalues, intervals, ind_unbiased_estimator, cov_unbiased_estimator
 
 
 def normalizing_constant(target_parameter,

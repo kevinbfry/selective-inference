@@ -14,9 +14,8 @@ def create_penalty_matrix(matrix_type,p,k=None,fused_dims=None):
 		the number of features
 	k : [int, np.ndarray]
 		This parametrizes the construction of the penalty matrix D 
-		(k-D fused or k-th order polynomial trend filtering), or is a 
-		custom penalty matrix of the specified type in penalty_matrix.
-		If None, defaults to 1D fused lasso or linear trend filtering.
+		(k-D fused or k-th order polynomial trend filtering), If None, 
+		defaults to 1D fused lasso or linear trend filtering.
 	fused_dims : sequence
 		Can't be None if penalty_matrix is "fused" and k is an int > 1,
 		must be a sequence of length k specifying the dimensions of the grid.
@@ -35,14 +34,9 @@ def create_trendfiltering_matrix(p,k=None):
 		the number of features
 	k : [int, np.ndarray]
 		This parametrizes the construction of the penalty matrix D 
-		(k-th order polynomial trend filtering), or is a  custom
-		penalty matrix of the specified type in penalty_matrix.
-		If None, defaults to linear trend filtering.
+		(k-th order polynomial trend filtering), If None, defaults 
+		to linear trend filtering.
 	"""
-	if isinstance(k,np.ndarray): # they provided matrix, so just return it
-		if len(k.shape) != 2:
-			raise ValueError("'k' must be an integer or 2D numpy array")
-		return k
 	if k is None:
 		k = 1
 	if isinstance(k,int):
@@ -82,17 +76,12 @@ def create_fused_lasso_matrix(p,k=None,fused_dims=None):
 		the number of features
 	k : [int, np.ndarray]
 		This parametrizes the construction of the penalty matrix D 
-		(k-D fused or k-th order polynomial trend filtering), or is a 
-		custom penalty matrix of the specified type in penalty_matrix.
-		If None, defaults to 1D fused lasso or linear trend filtering.
+		(k-D fused or k-th order polynomial trend filtering) If None, 
+		defaults to 1D fused lasso or linear trend filtering.
 	fused_dims : sequence
 		Can't be None if k is an int > 1, must be a sequence 
 		of length k specifying the dimensions of the grid.
 	"""
-	if isinstance(k,np.ndarray): # they provided matrix, so just return it
-		if len(k.shape) != 2:
-			raise ValueError("'k' must be an integer or 2D numpy array")
-		return k
 	if k is None:
 		k = 1
 	if isinstance(k,int):
@@ -165,7 +154,8 @@ def find_trendfiltering_nspaceb(D,active):
 	# where to put initial ones in basis
 	active_idx = np.where(active[head_offset:(len(active)-tail_offset)])[0] + head_offset
 
-	basis = np.zeros((p,nullity+k))
+	mat_dtype = np.longdouble if (k > 2 and p > 50) else np.float64
+	basis = np.zeros((p,nullity+k),dtype=mat_dtype)
 	head_cols = range(head_offset,nullity-tail_offset)
 	basis[(active_idx),head_cols] = 1
 
@@ -205,18 +195,28 @@ def find_fusedlasso_nspaceb(D,active):
 	dst_nodes = np.where(D_inactive == 1)[1]
 	edge_tuples = [(src_nodes[i],dst_nodes[i]) for i in range(D_inactive.shape[0])]
 	
-	G = nx.Graph()
+	G = nx.empty_graph(n=p)
 	G.add_edges_from(edge_tuples)
 
-	ccs = nx.connected_components(G)
-	n_ccs = nx.number_connected_components(G)
-	isos = nx.isolates(G)
-	basis = np.zeros((p,n_ccs))
+	ccs = list(nx.connected_components(G))
+	n_ccs = len(ccs)#nx.number_connected_components(G)
+	# isos = list(nx.isolates(G))
+	# n_isos = len(isos)
+	# print("Isolates:", isos)
+	basis = np.zeros((p, n_ccs))# + n_isos))
 
+	count = 0
 	for i,cc in enumerate(ccs):
+		count += len(list(cc))
+		# print("~~~~~~")
+		# print(list(cc))
+		# print(i)
 		basis[list(cc),i] = 1
-	for i,iso in isos:
-		basis[iso,i+n_ccs] = 1
+	assert(count==p)
+	assert(basis.sum()==p)
+	# stop2
+	# for i,iso in enumerate(isos):
+	# 	basis[iso,i+n_ccs] = 1
 
 	return basis
 

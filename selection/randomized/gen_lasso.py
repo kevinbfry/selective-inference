@@ -3,7 +3,7 @@ import functools
 from copy import copy
 
 import numpy as np
-from scipy.stats import norm as ndist
+from scipy.stats import norm as ndist, t as tdist
 
 # import functools
 # from copy import copy
@@ -13,6 +13,8 @@ from scipy.stats import norm as ndist
 
 import regreg.api as rr
 import regreg.affine as ra
+
+from .qp import qp_problem
 
 from ..constraints.affine import constraints
 from ..algorithms.sqrt_lasso import solve_sqrt_lasso, choose_lambda
@@ -57,11 +59,11 @@ class gen_lasso(object):
     def __init__(self,
                  loglike,
                  feature_weights,
-                 penalty_matrix,
                  ridge_term,
                  randomizer,
                  perturb=None,
-                 k=None,
+                 penalty_param=None,
+                 penalty_type=None,
                  fused_dims=None):
         r"""
         Create a new post-selection object for the LASSO problem
@@ -75,10 +77,15 @@ class gen_lasso(object):
         feature_weights : float
             $\lambda$ value for L-1 penalty.
 
-        penalty_matrix : [np.ndarray, string]
+        penalty_param : [np.ndarray, int]
             Either the penalty matrix for L-1 penalty (the D in |D\beta|_1),
-            in which a general solver is used, or a string in ["lasso",
-            "fused","trendfiltering"], in which case an optimized solver is used.
+            or if penalty_type is provided, this parametrizes the construction 
+            of the penalty matrix D (k-D fused or k-th order polynomial 
+            trend-filtering), or is a custom penalty matrix of the specified 
+            type in penalty_matrix. If None, defaults to 1D fused lasso, if 
+            penalty_type='fused' or linear trend-filtering if 
+            penalty_type='trendfiltering'. At least one of penalty_param and 
+            penalty_type must not be None.
 
         ridge_term : float
             How big a ridge term to add?
@@ -90,12 +97,11 @@ class gen_lasso(object):
             Random perturbation subtracted as a linear
             term in the objective function.
 
-        k : [int, np.ndarray]
-            If penalty_matrix is either "fused" or "trendfiltering",
-            this parametrizes the construction of the penalty matrix D 
-            (k-D fused or k-th order polynomial trend filtering), or is a 
-            custom penalty matrix of the specified type in penalty_matrix.
-            If None, defaults to 1D fused lasso or linear trend filtering.
+        penalty_type : [str, np.ndarray]
+            If None (default), a general solver is used, or a string in 
+            ["lasso", "fused","trendfiltering"], in which case an optimized
+            solver is used. At least one of penalty_param and 
+            penalty_type must not be None.
 
         fused_dims : integer sequence
             Can't be None if penalty_matrix is "fused" and k is an int > 1,
@@ -105,28 +111,38 @@ class gen_lasso(object):
         self.loglike = loglike
         self.nfeature = p = self.loglike.shape[0]
 
-        if np.asarray(feature_weights).shape == ():
-            feature_weights = np.ones(loglike.shape) * feature_weights
-        else:
+        # if np.asarray(feature_weights).shape == ():
+        #     feature_weights = np.ones(loglike.shape) * feature_weights
+        # else:
+        if np.asarray(feature_weights).shape != ():
             raise ValueError("'feature_weights' must be a scalar")
         self.feature_weights = feature_weights # np.asarray(feature_weights)
 
         self.ridge_term = ridge_term
 
-        if type(penalty_matrix) is np.ndarray:
-            self.D = penalty_matrix
-            self.structure = None
+        if penalty_param is None and penalty_type is None:
+            raise ValueError("'penalty_param' and 'penalty_type' cannot both be None")
+        if type(penalty_param) is np.ndarray:
+            self.D = penalty_param
+        elif type(penalty_type) is str:
+            if penalty_param is None or type(penalty_param) is int:
+                self.D = create_penalty_matrix(penalty_type,p,k=penalty_param,fused_dims=fused_dims)
+            else:
+                raise ValueError("'penalty_param' must be an int or None if 'penalty_type' is not None")
         else:
-            self.D = create_penalty_matrix(penalty_matrix,p,k=k,fused_dims=fused_dims)
-            self.structure = penalty_matrix
+            raise ValueError("'penalty_param' must be a numpy array or 'penalty_type' must be a string")
+
+        self.structure = penalty_type
 
 
-        self.penalty = rr.l1norm(self.D.shape[0],lagrange=np.mean(self.feature_weights)) #### temp, change
+        self.penalty = rr.l1norm(self.D.shape[0],lagrange=feature_weights)
         self._initial_omega = perturb  # random perturbation
 
         self.randomizer = randomizer
 
     def fit(self,
+            use_admm=True,
+            use_closed_form=True,
             solve_args={'tol': 1.e-12, 'min_its': 50},
             perturb=None):
         """
@@ -151,18 +167,43 @@ class gen_lasso(object):
             self._initial_omega = self.randomizer.sample()
 
         quad = rr.identity_quadratic(self.ridge_term, 0, -self._initial_omega, 0)
-        problem = rr.admm_problem(self.loglike, self.penalty, self.D,0.5)
-        problem.solve(quadratic=quad, niter=1000)
-        self.initial_soln = problem.loss_coefs # \beta
-        self.initial_penalty_soln = problem.atom_coefs # D\beta
+
+        X, y = self.loglike.data
+        if use_admm:
+            admm_quad = (X.T.dot(X) + self.ridge_term * np.eye(p)) if use_closed_form else None
+            problem = rr.admm_problem(self.loglike, 
+                                      self.penalty, 
+                                      self.D,
+                                      0.5, 
+                                      X.T.dot(y),
+                                      self._initial_omega,
+                                      admm_quad)
+            # problem = rr.admm_problem(self.loglike, 
+            #                           self.penalty, 
+            #                           self.D, 
+            #                           quadratic=self.loglike.quadratic,
+            #                           rho_quadratic=rho_quadratic)
+            problem.solve(niter=25)
+            # problem.solve(quadratic=quad, niter=250)
+            self.initial_soln = problem.loss_coefs # \beta
+            self.initial_penalty_soln = problem.atom_coefs # D\beta
+        else:
+            problem = qp_problem(X, y, self.D, 
+                                 ridge_term=self.ridge_term, 
+                                 lam=self.feature_weights, 
+                                 randomization=self._initial_omega)
+            # problem.solve()
+            self.exact_initial_soln = self.initial_soln = problem.solve() # \beta
+            self.exact_initial_penalty_soln = self.initial_penalty_soln = self.D.dot(self.initial_soln) # D\beta
+            self.initial_penalty_soln = self.initial_penalty_soln * (np.fabs(self.initial_penalty_soln) > 1e-6*np.max(X))
 
         active_signs = self.active_signs = np.sign(self.initial_penalty_soln)
         active = self._active = active_signs != 0 # used for finding nullspace basis
 
         coef_active_signs = np.sign(self.initial_soln)
         coef_active_variables = coef_active_signs != 0
-        self.selection_variable = {'sign': coef_active_signs,
-                                   'variables': coef_active_variables}
+        self.selection_variable = {'sign': active_signs,
+                                   'variables': active}
 
         # initial state for opt variables
         initial_subgrad = -(self.loglike.smooth_objective(self.initial_soln, 'grad') +
@@ -180,14 +221,16 @@ class gen_lasso(object):
 
         self.nsb = nsb
 
-        nsb_pinv = np.linalg.inv(nsb.T.dot(nsb)).dot(nsb.T)
-        self.initial_alpha = nsb_pinv.dot(self.initial_soln) # \beta = nsb\alpha => (nsb^Tnsb)^{-1}nsb\beta = \alpha
-        self.observed_opt_state = self.initial_alpha
+        if active.sum() > 0:
+            nsb_pinv = np.linalg.inv(nsb.T.dot(nsb)).dot(nsb.T)
+            self.initial_alpha = nsb_pinv.dot(self.initial_soln) # \beta = nsb\alpha => (nsb^Tnsb)^{-1}nsb\beta = \alpha
+            self.observed_opt_state = self.initial_alpha
+        else:
+            self.observed_opt_state = self.initial_alpha = self.initial_soln
 
         self.num_opt_var = self.observed_opt_state.shape[0] ###### opt_var is now alpha
 
-        X, y = self.loglike.data
-        W = self._W = np.ones(X.shape[0]) ##### TODO: should be something like self.loglike.saturated_loss.hessian(X.dot(beta_bar))
+        W = self._W = self.loglike.saturated_loss.hessian(X.dot(self.initial_soln))
         _hessian = np.dot(X.T,X*W[:,None])
 
         _score_linear_term = -_hessian
@@ -207,14 +250,16 @@ class gen_lasso(object):
         self._setup = True
         self.ndim = self.loglike.shape[0]
 
-        if active.sum() == 0:
+        if False:#active.sum() == 0:
             self.sampler = None
         else:
             # compute implied mean and covariance
 
             _, prec = self.randomizer.cov_prec
             opt_linear, opt_offset = self.opt_transform
-            A = (_hessian + self.ridge_term * np.eye(p)).dot(nsb)
+            A = _hessian + self.ridge_term * np.eye(p)
+            if active.sum() > 0:
+                A = A.dot(nsb)
 
             if np.asarray(prec).shape in [(), (0,)]:
                 cond_precision = A.T.dot(A) * prec
@@ -239,15 +284,21 @@ class gen_lasso(object):
 
             log_density = functools.partial(log_density, logdens_linear, opt_offset, cond_precision)
 
-            # now make the constraints: -sign(D\hat\beta)D\Gamma\aplha <= 0
 
-            A_scaling = -np.diag(active_signs[active]).dot(self.D[active,:].dot(nsb))
-            b_scaling = np.zeros(active.sum())
+            # constrain |D\beta| = 0
+            if active.sum() == 0:
+                A_scaling = np.vstack((self.D, -self.D))
+                b_scaling = np.ones(2*self.D.shape[0]) * 1e-8 * np.max(X) ## tolerance since QP soln is not exact
+            # constrain -sign(D\hat\beta)D\Gamma\aplha <= 0
+            else:
+                A_scaling = -np.diag(active_signs[active]).dot(self.D[active,:].dot(nsb))
+                b_scaling = np.zeros(active.sum())
 
             affine_con = constraints(A_scaling,
                                      b_scaling,
                                      mean=cond_mean,
                                      covariance=cond_cov)
+
 
             logdens_transform = (logdens_linear, opt_offset)
 
@@ -258,13 +309,14 @@ class gen_lasso(object):
                                                    logdens_transform,
                                                    selection_info=self.selection_variable)  # should be signs and the subgradients we've conditioned on
 
-        return coef_active_signs, active_signs
+        return coef_active_signs, active_signs if active.sum() > 0 else 2*np.ones_like(active_signs)
 
     def summary(self,
                 observed_target, 
                 cov_target, 
                 cov_target_score, 
                 alternatives,
+                opt_sample=None,
                 parameter=None,
                 level=0.9,
                 ndraw=10000,
@@ -296,34 +348,45 @@ class gen_lasso(object):
         if parameter is None:
             parameter = np.zeros_like(observed_target)
 
-        ## handle case where active set is empty, therefore no sampler
-        if self.sampler is None:
-            sd_target = np.sqrt(np.diag(cov_target))
-            pivots = ndist.cdf((observed_target - parameter)/sd_target)
+        ## handle case where active set is empty
+        if self._active.sum() == 0:
+            (ind_unbiased_estimator, 
+            cov_unbiased_estimator) = self.selective_MLE(observed_target,
+                                                        cov_target,
+                                                        cov_target_score)[5:7]
 
+            sd_target = np.sqrt(np.diag(cov_unbiased_estimator))
+            pivots = ndist.cdf((ind_unbiased_estimator - parameter)/sd_target)
+    
             if not np.all(parameter == 0):
-                pvalues = ndist.cdf((observed_target - np.zeros_like(parameter))/sd_target)
+                pvalues = ndist.cdf((ind_unbiased_estimator - np.zeros_like(parameter))/sd_target)
             else:
                 pvalues = pivots
 
             if alternatives == 'twosided':
-                pvalues = 2*np.minimum(pvalues,1-pvalues)
+                pvalues = 2 * np.minimum(pvalues, 1-pvalues)
             if alternatives == 'greater':
-                pvalues = 1-pvalues
+                pvalues = 1 - pvalues
 
 
             intervals = None
             if compute_intervals:
-                z = ndist.ppf(level)
-                lower_limit = observed_target - z*sd_target
-                upper_limit = observed_target + z*sd_target
+                _, y = self.loglike.data
+                n = y.shape[0]
+                alpha = 1 - level
+                z = ndist.ppf(1 - alpha/2)
+                # t = tdist.ppf(1 - alpha/2, n - ind_unbiased_estimator.shape[0])
+                lower_limit = ind_unbiased_estimator - z*sd_target
+                upper_limit = ind_unbiased_estimator + z*sd_target
 
-                lower_limit = np.expand_dims(lower_limit,1)
-                upper_limit = np.expand_dims(upper_limit,1)
-                intervals = np.hstack((lower_limit,upper_limit));
-
+                lower_limit = np.expand_dims(lower_limit, 1)
+                upper_limit = np.expand_dims(upper_limit, 1)
+                intervals = np.hstack((lower_limit, upper_limit))
         else:
-            opt_sample = self.sampler.sample(ndraw, burnin)
+            if opt_sample is None:
+                opt_sample = self.sampler.sample(ndraw, burnin)
+            else:
+                ndraw = opt_sample.shape[0]
 
             pivots = self.sampler.coefficient_pvalues(observed_target,
                                                       cov_target,
@@ -331,10 +394,6 @@ class gen_lasso(object):
                                                       parameter=parameter,
                                                       sample=opt_sample,
                                                       alternatives=alternatives)
-
-            #MLE_intervals = self.selective_MLE(observed_target,
-            #                                   cov_target,
-            #                                   cov_target_score)[5]
 
             if not np.all(parameter == 0):
                 pvalues = self.sampler.coefficient_pvalues(observed_target,
@@ -349,19 +408,20 @@ class gen_lasso(object):
             intervals = None
             if compute_intervals:
 
-                # MLE_intervals = self.selective_MLE(observed_target,
-                                                   # cov_target,
-                                                   # cov_target_score)[4]
+                MLE_intervals = self.selective_MLE(observed_target,
+                                                   cov_target,
+                                                   cov_target_score)[4]
 
                 intervals = self.sampler.confidence_intervals(observed_target,
                                                               cov_target,
                                                               cov_target_score,
                                                               sample=opt_sample,
-                                                              # initial_guess=MLE_intervals,
+                                                              initial_guess=MLE_intervals,
                                                               level=level)
 
+        expt_val_unbiased_est = y + self._initial_omega/2.
 
-        return pivots, pvalues, intervals
+        return pivots, pvalues, intervals, np.fabs(ind_unbiased_estimator - expt_val_unbiased_est)
 
     def selective_MLE(self,
                       observed_target, 
@@ -385,7 +445,8 @@ class gen_lasso(object):
     def gaussian(X,
                  Y,
                  feature_weights,
-                 penalty_matrix,
+                 penalty_param=None,
+                 penalty_type=None,
                  sigma=1.,
                  quadratic=None,
                  ridge_term=None,
@@ -445,8 +506,9 @@ class gen_lasso(object):
 
         return gen_lasso(loglike, 
                      np.asarray(feature_weights) / sigma ** 2,
-                     penalty_matrix,
-                     ridge_term, randomizer)
+                     ridge_term, randomizer,
+                     penalty_param=penalty_param,
+                     penalty_type=penalty_type)
 
     @staticmethod
     def logistic(X,
@@ -780,7 +842,7 @@ def fused_targets(loglike,
 
     if dispersion is None:
         dispersion = ((y-loglikecc.saturated_loss.mean_function(
-                       Xcc.dot(observed_target))) ** 2 / W).sum() / (n-ncc)
+                       Xcc.dot(observed_target))) ** 2 / W).sum() / (n-ncc)#-1)
 
     return observed_target, cov_target * dispersion, crosscov_target_score.T * dispersion, alternatives
 
@@ -794,6 +856,7 @@ def selected_targets(loglike,
     X, y = loglike.data
     n, p = X.shape
 
+    ## TODO: when lambda large and no features selected
     Xfeat = X[:, features]
     Qfeat = Xfeat.T.dot(W[:, None] * Xfeat)
     observed_target = restricted_estimator(loglike, features, solve_args=solve_args)
@@ -836,8 +899,8 @@ def full_targets(loglike,
     crosscov_target_score[features] = -np.identity(cov_target.shape[0])
 
     if dispersion is None:  # use Pearson's X^2
-        dispersion = 1#(((y - loglike.saturated_loss.mean_function(X.dot(full_estimator))) ** 2 / W).sum() / 
-                      #(n - p))
+        dispersion = (((y - loglike.saturated_loss.mean_function(X.dot(full_estimator))) ** 2 / W).sum() / 
+                      (n - p))
 
     alternatives = ['twosided'] * features.sum()
     return observed_target, cov_target * dispersion, crosscov_target_score.T * dispersion, alternatives
@@ -897,7 +960,8 @@ def form_targets(target,
                  **kwargs):
     _target = {'full':full_targets,
                'selected':selected_targets,
-               'debiased':debiased_targets}[target]
+               'debiased':debiased_targets,
+               'fused':fused_targets}[target]
     return _target(loglike,
                    W,
                    features,
