@@ -135,9 +135,10 @@ class query(object):
                                                   normal_sample=target_sample,
                                                   alternatives=alternatives)
 
-        MLE_intervals = self.selective_MLE(observed_target,
-                                           cov_target,
-                                           cov_target_score)[5]
+        # MLE_intervals = self.selective_MLE(observed_target,
+        #                                    cov_target,
+        #                                    cov_target_score,
+        #                                    level=level)[5]
 
         if not np.all(parameter == 0):
             pvalues = self.sampler.coefficient_pvalues(observed_target,
@@ -155,7 +156,8 @@ class query(object):
 
             MLE_intervals = self.selective_MLE(observed_target,
                                                cov_target,
-                                               cov_target_score)[4]
+                                               cov_target_score,
+                                               level=level)[4]
 
             intervals = self.sampler.confidence_intervals(observed_target,
                                                           cov_target,
@@ -182,6 +184,8 @@ class query(object):
         return self.sampler.selective_MLE(observed_target,
                                           cov_target,
                                           cov_target_score,
+                                          self.randomizer.cov_prec[1],
+                                          self._initial_omega,
                                           self.observed_opt_state,
                                           level=level,
                                           solve_args=solve_args)
@@ -763,8 +767,10 @@ class affine_gaussian_sampler(optimization_sampler):
                       observed_target, 
                       cov_target, 
                       cov_target_score, 
+                      prec_randomizer,
+                      init_omega,
                       init_soln, # initial (observed) value of optimization variables -- used as a feasible point.
-                                 # precise value used only for independent estimator 
+                                 # precise value used only for independent estimator
                       solve_args={'tol':1.e-12}, 
                       level=0.9):
         """
@@ -776,6 +782,8 @@ class affine_gaussian_sampler(optimization_sampler):
         return selective_MLE(observed_target, 
                              cov_target, 
                              cov_target_score, 
+                             prec_randomizer, 
+                             init_omega,
                              init_soln, 
                              self.affine_con.mean,
                              self.affine_con.covariance,
@@ -1296,9 +1304,46 @@ def _solve_barrier_nonneg(conjugate_arg,
     hess = np.linalg.inv(precision + np.diag(barrier_hessian(current)))
     return current_value, current, hess
 
+def ind_unbiased_estimate(observed_target, 
+                          cov_target, 
+                          cov_target_score, 
+                          prec_randomizer, 
+                          init_omega,
+                          level=0.9):
+
+    if np.asarray(observed_target).shape in [(), (0,)]:
+        raise ValueError('no target specified')
+
+    observed_target = np.atleast_1d(observed_target)
+    prec_target = np.linalg.inv(cov_target)
+
+    gamma = -cov_target_score.T.dot(prec_target)
+    prec_randomizer = np.asarray(prec_randomizer)
+    linear_target = np.eye(cov_target.shape[0]) + \
+                           cov_target.dot(gamma.T.dot(prec_randomizer).dot(gamma))
+    # cond_cov_target = np.linalg.inv(linear_target).dot(cov_target)
+    ind_unbiased_estimator = observed_target - cov_target.dot(gamma.T.dot(prec_randomizer).dot(init_omega))
+    cov_unbiased_estimator = cov_target.dot(linear_target.T)
+
+    unbiased_Z_scores = ind_unbiased_estimator / np.sqrt(np.diag(cov_unbiased_estimator))
+    unbiased_pvalues = ndist.cdf(unbiased_Z_scores)
+    unbiased_pvalues = 2 * np.minimum(unbiased_pvalues, 1 - unbiased_pvalues)
+
+    alpha = 1 - level
+    quantile = ndist.ppf(1 - alpha / 2.)
+    unbiased_intervals = np.vstack([ind_unbiased_estimator - quantile * np.sqrt(np.diag(cov_unbiased_estimator)),
+                           ind_unbiased_estimator + quantile * np.sqrt(np.diag(cov_unbiased_estimator))]).T
+
+    return (ind_unbiased_estimator, 
+            cov_unbiased_estimator,
+            unbiased_Z_scores, unbiased_pvalues,
+            unbiased_intervals)
+
 def selective_MLE(observed_target, 
                   cov_target, 
                   cov_target_score, 
+                  prec_randomizer, 
+                  init_omega,
                   init_soln, # initial (observed) value of optimization variables -- used as a feasible point.
                              # precise value used only for independent estimator 
                   cond_mean,
@@ -1315,9 +1360,6 @@ def selective_MLE(observed_target,
 
     """
 
-    if np.asarray(observed_target).shape in [(), (0,)]:
-        raise ValueError('no target specified')
-
     observed_target = np.atleast_1d(observed_target)
     prec_target = np.linalg.inv(cov_target)
 
@@ -1326,12 +1368,8 @@ def selective_MLE(observed_target,
     # logdens_linear determines how the argument of the optimization density
     # depends on the score, not how the mean depends on score, hence the minus sign
 
-    ## orig
-    # target_lin = - logdens_linear.dot(cov_target_score.T.dot(prec_target)) 
-    # target_offset = cond_mean - target_lin.dot(observed_target)
-
-    gamma = cov_target_score.T.dot(prec_target)
-    target_lin = - logdens_linear.dot(gamma) 
+    target_lin = - logdens_linear.dot(cov_target_score.T.dot(prec_target)) 
+    target_offset = cond_mean - target_lin.dot(observed_target)
 
     prec_opt = np.linalg.inv(cond_cov)
 
@@ -1349,16 +1387,9 @@ def selective_MLE(observed_target,
                              offset,
                              **solve_args)
 
-    ## orig
-    # final_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean - soln)))
-    # ind_unbiased_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean
-    #                                                                                         - init_soln)))
-    
-    estimator_lin = cov_target.dot(target_lin.T.dot(prec_opt))
-    final_estimator = observed_target + estimator_lin.dot(cond_mean - soln)
-    ind_unbiased_estimator = observed_target + estimator_lin.dot(cond_mean - init_soln)
-    cov_unbiased_estimator = prec_target.dot((np.eye(prec_target.shape[0]) + estimator_lin.dot(target_lin)).T)
-
+    final_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean - soln)))
+    ind_unbiased_estimator = observed_target + cov_target.dot(target_lin.T.dot(prec_opt.dot(cond_mean
+                                                                                            - init_soln)))
     L = target_lin.T.dot(prec_opt)
     observed_info_natural = prec_target + L.dot(target_lin) - L.dot(hess.dot(L.T))
     observed_info_mean = cov_target.dot(observed_info_natural.dot(cov_target))
@@ -1372,7 +1403,24 @@ def selective_MLE(observed_target,
     intervals = np.vstack([final_estimator - quantile * np.sqrt(np.diag(observed_info_mean)),
                            final_estimator + quantile * np.sqrt(np.diag(observed_info_mean))]).T
 
-    return final_estimator, observed_info_mean, Z_scores, pvalues, intervals, ind_unbiased_estimator, cov_unbiased_estimator
+    (ind_unbiased_estimator, 
+     cov_unbiased_estimator,
+     unbiased_Z_scores, unbiased_pvalues,
+     unbiased_intervals) = ind_unbiased_estimate(observed_target,
+                                                 cov_target, 
+                                                 cov_target_score, 
+                                                 prec_randomizer, 
+                                                 init_omega,
+                                                 level=level)
+
+    return (final_estimator, 
+            observed_info_mean, 
+            Z_scores, pvalues, 
+            intervals, 
+            ind_unbiased_estimator, 
+            cov_unbiased_estimator,
+            unbiased_Z_scores, unbiased_pvalues,
+            unbiased_intervals)
 
 
 def normalizing_constant(target_parameter,

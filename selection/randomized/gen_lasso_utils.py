@@ -240,7 +240,7 @@ def find_nullspace_basis(D,active):
 		return find_nspaceb_identity(active)
 
 	_,s,v = svd(D[(~active),:])
-	basis = v[len(s):,:].T # v is returned w/ rows being right singular values of D_{-E}
+	basis = v[len(s):,:].T # v is returned w/ rows being right singular vectors of D_{-E}
 	return basis
 
 

@@ -19,9 +19,7 @@ from .qp import qp_problem
 from ..constraints.affine import constraints
 from ..algorithms.sqrt_lasso import solve_sqrt_lasso, choose_lambda
 
-from .query import (query,
-                    multiple_queries,
-                    langevin_sampler,
+from .query import (gaussian_query,
                     affine_gaussian_sampler)
 
 from .reconstruction import reconstruct_opt
@@ -38,7 +36,7 @@ from .gen_lasso_utils import find_trendfiltering_nspaceb, find_fusedlasso_nspace
 #### - parametric covariance
 #### - Gaussian randomization
 
-class gen_lasso(object):
+class gen_lasso(gaussian_query):
     r"""
     A class for the randomized generalized LASSO for post-selection inference.
     The problem solved is
@@ -48,7 +46,7 @@ class gen_lasso(object):
         \text{minimize}_{\beta} \ell(\beta) + 
             \sum_{i=1}^p \lambda_i |D_i\beta| - \omega^T\beta + \frac{\epsilon}{2} \|\beta\|^2_2
 
-    where $\lambda$ is `lam`, D is the penalty matrix, $\omega$ is a 
+    where $\lambda$ is `lam`, $D$ is the penalty matrix, $\omega$ is a 
     randomization generated below and the last term is a small ridge 
     penalty. Each static method forms $\ell$ as well as the $\ell_1$ 
     penalty. The generic class forms the remaining two terms in the 
@@ -223,7 +221,7 @@ class gen_lasso(object):
 
         if active.sum() > 0:
             nsb_pinv = np.linalg.inv(nsb.T.dot(nsb)).dot(nsb.T)
-            self.initial_alpha = nsb_pinv.dot(self.initial_soln) # \beta = nsb\alpha => (nsb^Tnsb)^{-1}nsb\beta = \alpha
+            self.initial_alpha = nsb_pinv.dot(self.initial_soln) # \beta = nsb\alpha => (nsb^Tnsb)^{-1}nsb^T\beta = \alpha
             self.observed_opt_state = self.initial_alpha
         else:
             self.observed_opt_state = self.initial_alpha = self.initial_soln
@@ -270,7 +268,7 @@ class gen_lasso(object):
                 cond_cov = np.linalg.inv(cond_precision)
                 logdens_linear = cond_cov.dot(A.T).dot(prec)
 
-            cond_mean = -logdens_linear.dot(self._initial_omega - (_hessian + self.ridge_term * np.eye(p)).dot(self.initial_soln))
+            cond_mean = - logdens_linear.dot(self._initial_omega - (_hessian + self.ridge_term * np.eye(p)).dot(self.initial_soln))
 
             # density as a function of score and optimization variables
 
@@ -309,7 +307,7 @@ class gen_lasso(object):
                                                    logdens_transform,
                                                    selection_info=self.selection_variable)  # should be signs and the subgradients we've conditioned on
 
-        return coef_active_signs, active_signs if active.sum() > 0 else 2*np.ones_like(active_signs)
+        return coef_active_signs, active_signs # if active.sum() > 0 else 2*np.ones_like(active_signs)
 
     def summary(self,
                 observed_target, 
@@ -345,15 +343,20 @@ class gen_lasso(object):
             Use a known value for dispersion, or Pearson's X^2?
         """
 
+
         if parameter is None:
             parameter = np.zeros_like(observed_target)
 
         ## handle case where active set is empty
-        if self._active.sum() == 0:
+        if self.structure != "fused" and self._active.sum() == 0:
             (ind_unbiased_estimator, 
-            cov_unbiased_estimator) = self.selective_MLE(observed_target,
-                                                        cov_target,
-                                                        cov_target_score)[5:7]
+            cov_unbiased_estimator,
+            unbiased_Z_scores, 
+            unbiased_pvalues,
+            unbiased_intervals) = self.selective_MLE(observed_target,
+                                                     cov_target,
+                                                     cov_target_score,
+                                                     level=level)[5:]
 
             sd_target = np.sqrt(np.diag(cov_unbiased_estimator))
             pivots = ndist.cdf((ind_unbiased_estimator - parameter)/sd_target)
@@ -408,38 +411,19 @@ class gen_lasso(object):
             intervals = None
             if compute_intervals:
 
-                MLE_intervals = self.selective_MLE(observed_target,
-                                                   cov_target,
-                                                   cov_target_score)[4]
+                # MLE_intervals = self.selective_MLE(observed_target,
+                #                                    cov_target,
+                #                                    cov_target_score,
+                #                                    level=level)[4]
 
                 intervals = self.sampler.confidence_intervals(observed_target,
                                                               cov_target,
                                                               cov_target_score,
                                                               sample=opt_sample,
-                                                              initial_guess=MLE_intervals,
+                                                              # initial_guess=MLE_intervals,
                                                               level=level)
 
-        expt_val_unbiased_est = y + self._initial_omega/2.
-
-        return pivots, pvalues, intervals, np.fabs(ind_unbiased_estimator - expt_val_unbiased_est)
-
-    def selective_MLE(self,
-                      observed_target, 
-                      cov_target, 
-                      cov_target_score, 
-                      level=0.9,
-                      solve_args={'tol':1.e-12}):
-        """
-        Parameters
-        ----------
-
-        """
-        
-        return self.sampler.selective_MLE(observed_target,
-                                          cov_target,
-                                          cov_target_score,
-                                          self.observed_opt_state,
-                                          solve_args=solve_args)
+        return pivots, pvalues, intervals
 
     @staticmethod
     def gaussian(X,
@@ -822,6 +806,8 @@ def fused_targets(loglike,
     X, y = loglike.data
     n, p = X.shape
 
+    if (len(ccs) == 0):
+        raise ValueError("No connected components provided, no targets to estimate.")
     if (len(ccs) > 1):
         Xcc = np.vstack([X[:,cc].sum(axis=1) for cc in ccs]).T
     else:
@@ -829,10 +815,15 @@ def fused_targets(loglike,
     ncc = Xcc.shape[1]
     loglikecc = rr.glm.gaussian(Xcc, y, coef=loglike.coef, quadratic=None)#loglike.quadratic)
     observed_target = loglikecc.solve(**solve_args)
-    Qcc = Xcc.T.dot(W[:,None] * Xcc)
-    cov_target = np.linalg.inv(Qcc)
-    _score_linear = -Xcc.T.dot(W[:,None] * X).T
-    crosscov_target_score = _score_linear.dot(cov_target)
+    if W.ndim == 1:
+        Qcc = Xcc.T.dot(W[:,None] * Xcc)
+        _score_linear = -Xcc.T.dot(W[:,None] * X).T
+    else:
+        Qcc = Xcc.T.dot(W.dot(Xcc))
+        _score_linear = -Xcc.T.dot(W.dot(X)).T
+    cov_target = Qcc/(np.diag(Xcc.T.dot(Xcc))**2) # np.linalg.inv(Qcc)
+    crosscov_target_score = _score_linear.dot(np.linalg.inv(Xcc.T.dot(Xcc)))
+    # assert(0==1)
     alternatives = ['twosided'] * ncc
     ccs_idx = np.arange(ncc)
 
@@ -841,8 +832,12 @@ def fused_targets(loglike,
             alternatives[i] = sign_info[ccs_idx[i]]
 
     if dispersion is None:
-        dispersion = ((y-loglikecc.saturated_loss.mean_function(
-                       Xcc.dot(observed_target))) ** 2 / W).sum() / (n-ncc)#-1)
+        if W.ndim == 1:
+            dispersion = ((y-loglikecc.saturated_loss.mean_function(
+                           Xcc.dot(observed_target))) ** 2 / W).sum() / (n-ncc)#-1)
+        else:
+            dispersion = ((y-loglikecc.saturated_loss.mean_function(
+                           Xcc.dot(observed_target))) ** 2 / np.diag(W)).sum() / (n-ncc)#-1)
 
     return observed_target, cov_target * dispersion, crosscov_target_score.T * dispersion, alternatives
 
@@ -853,10 +848,12 @@ def selected_targets(loglike,
                      dispersion=None,
                      solve_args={'tol': 1.e-12, 'min_its': 50}):
 
+    # if features.sum() == 0:
+    #     raise ValueError('Empty feature set, no targets to estimate.')
+    
     X, y = loglike.data
     n, p = X.shape
 
-    ## TODO: when lambda large and no features selected
     Xfeat = X[:, features]
     Qfeat = Xfeat.T.dot(W[:, None] * Xfeat)
     observed_target = restricted_estimator(loglike, features, solve_args=solve_args)
@@ -881,6 +878,9 @@ def full_targets(loglike,
                  features, 
                  dispersion=None,
                  solve_args={'tol': 1.e-12, 'min_its': 50}):
+
+    if features.sum() == 0:
+        raise ValueError('Empty feature set, no targets to estimate.')
 
     X, y = loglike.data
     n, p = X.shape
@@ -912,6 +912,9 @@ def debiased_targets(loglike,
                      penalty=None, #required kwarg
                      dispersion=None,
                      debiasing_args={}):
+
+    if features.sum() == 0:
+        raise ValueError('Empty feature set, no targets to estimate.')
 
     if penalty is None:
         raise ValueError('require penalty for consistent estimator')
